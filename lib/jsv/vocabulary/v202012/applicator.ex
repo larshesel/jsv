@@ -600,7 +600,13 @@ defmodule JSV.Vocabulary.V202012.Applicator do
   # ordered from 0 to N if the error is normalized.
   @spec validate_items([validation_item], list, Validator.context(), module) :: {list, Validator.context()}
         when validation_item: {term, non_neg_integer(), nil | Validator.validator(), term}
-  def validate_items(items_with_schema, data, vctx, error_formatter \\ __MODULE__) do
+  def validate_items(items_with_schema, data, vctx, error_formatter \\ __MODULE__)
+
+  def validate_items(items_with_schema, data, %{flag: true} = vctx, error_formatter) do
+    {data, validate_items_until_error(items_with_schema, data, vctx, error_formatter)}
+  end
+
+  def validate_items(items_with_schema, data, vctx, error_formatter) do
     {items, vctx} =
       items_with_schema
       |> :lists.reverse()
@@ -623,6 +629,26 @@ defmodule JSV.Vocabulary.V202012.Applicator do
       end)
 
     {items, vctx}
+  end
+
+  defp validate_items_until_error([{_kind, _index, _data_item, nil} | rest], data, vctx, error_formatter) do
+    validate_items_until_error(rest, data, vctx, error_formatter)
+  end
+
+  defp validate_items_until_error([{kind, index, data_item, subschema} | rest], data, vctx, error_formatter) do
+    level = boolean_schema_level(subschema)
+
+    case Validator.validate_in(data_item, index, kind, subschema, vctx, level) do
+      {:ok, _, vctx} ->
+        validate_items_until_error(rest, data, vctx, error_formatter)
+
+      {:error, vctx} ->
+        JSV.Validator.__with_error__(error_formatter, vctx, kind, data, item_error_args(index, subschema))
+    end
+  end
+
+  defp validate_items_until_error([], _data, vctx, _error_formatter) do
+    vctx
   end
 
   # ---------------------------------------------------------------------------

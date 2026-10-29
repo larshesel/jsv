@@ -521,6 +521,25 @@ defmodule JSV do
     end
   end
 
+  @doc """
+  Returns whether the data is valid for the given schema root.
+
+  Validation stops at the first error and the paths needed to report errors
+  are not tracked, so this costs less than `validate/3`. Use `validate/3` to
+  get the errors. Schemas that define casts are validated with `validate/3`, as
+  a failing cast makes the data invalid.
+  """
+  @doc group: @doc_group
+  @spec valid?(term, JSV.Root.t()) :: boolean
+  def valid?(data, %JSV.Root{has_casts: true} = root) do
+    match?({:ok, _}, validate(data, root))
+  end
+
+  def valid?(data, %JSV.Root{} = root) do
+    opts = %{cast: false, cast_formats: false, flag: true}
+    match?({:ok, _, _}, validation_entrypoint(root, data, opts))
+  end
+
   # From https://github.com/fishcakez/dialyze/blob/6698ae582c77940ee10b4babe4adeff22f1b7779/lib/mix/tasks/dialyze.ex#L168
   @doc false
   @spec otp_version :: String.t()

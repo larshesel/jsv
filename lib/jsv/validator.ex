@@ -30,6 +30,9 @@ defmodule JSV.Validator do
     # :eval_path stores both the current keyword nesting leading to an error, and
     # the namespace changes for error absolute location.
 
+    # :flag is set by JSV.valid?/2. The validation stops at the first error and
+    # the data, schema and evaluation paths are not tracked.
+
     @enforce_keys [
       :validators,
       :scope,
@@ -42,7 +45,8 @@ defmodule JSV.Validator do
       :opts,
       :cast_stacks,
       :feature_cast,
-      :feature_unevaluated
+      :feature_unevaluated,
+      :flag
     ]
     defstruct @enforce_keys
 
@@ -77,7 +81,9 @@ defmodule JSV.Validator do
       opts: opts,
       cast_stacks: %{},
       feature_cast: feature_cast,
-      feature_unevaluated: feature_unevaluated
+      feature_unevaluated: feature_unevaluated,
+      # Casts are keyed by data path, so they disable flag mode.
+      flag: Map.get(opts, :flag, false) and not feature_cast
     }
   end
 
@@ -113,6 +119,10 @@ defmodule JSV.Validator do
   # When :feature_cast is false (no cast anywhere in the schema, or the :cast
   # option is disabled), we skip the whole cast stack machinery: nothing will
   # ever be cast, so the push/pop bookkeeping is pure overhead.
+  def validate(data, %Subschema{} = sub, %{flag: true} = vctx) do
+    call_vocabulary(sub.validators, data, vctx)
+  end
+
   def validate(data, %Subschema{} = sub, %{feature_cast: true} = vctx) do
     %{validators: validators, cast: cast} = sub
     %{cast_stacks: cast_stacks, data_path: data_path} = vctx
@@ -239,6 +249,9 @@ defmodule JSV.Validator do
       {:ok, new_data, new_vctx} ->
         do_reduce(rest, new_data, new_vctx, fun)
 
+      {:error, %ValidationContext{errors: [_ | _], flag: true}} = error ->
+        error
+
       # on :error an error MUST be set; data is unchanged, vctx carries on
       {:error, %ValidationContext{errors: [_ | _]} = new_vctx} ->
         do_reduce(rest, data, new_vctx, fun)
@@ -258,6 +271,9 @@ defmodule JSV.Validator do
         # When returning :ok, the errors may be empty or not, depending on
         # previous iterations.
         call_vocabulary(vocab, new_data, new_vctx)
+
+      {:error, %ValidationContext{errors: [_ | _], flag: true}} = error ->
+        error
 
       # When returning :error, an error MUST be set
       {:error, %ValidationContext{errors: [_ | _]} = new_vctx} ->
@@ -280,6 +296,10 @@ defmodule JSV.Validator do
   the validation by the given `subschema`.
   """
   @spec validate_detach(term, eval_sub_path, validator, context) :: result
+  def validate_detach(data, _add_eval_path, subschema, %ValidationContext{flag: true} = vctx) do
+    validate(data, subschema, %{vctx | evaluated: [%{}], errors: []})
+  end
+
   def validate_detach(data, add_eval_path, subschema, %ValidationContext{} = vctx) do
     %{eval_path: eval_path, schema_path: schema_path} = vctx
 
@@ -330,6 +350,37 @@ defmodule JSV.Validator do
 
   def validate_key(key, add_eval_path, subvalidators, vctx, boolean_schema_level) when is_binary(key) do
     validate_sub_term(key, key, add_eval_path, subvalidators, vctx, boolean_schema_level, _flag_evaluated? = false)
+  end
+
+  # The descent reuses the parent context: paths are not tracked and errors are
+  # always empty before the first one ends the validation. Seen refs are cleared
+  # as in the regular validation, otherwise they pile up with the depth.
+  defp validate_sub_term(
+         data,
+         key,
+         _add_eval_path,
+         subvalidators,
+         %ValidationContext{flag: true} = vctx,
+         level,
+         flag_evaluated?
+       ) do
+    sub_vctx =
+      case vctx do
+        %{feature_unevaluated: true, evaluated: evaluated} -> %{vctx | evaluated: [%{} | evaluated], seen_refs: []}
+        _ -> %{vctx | seen_refs: []}
+      end
+
+    result =
+      case subvalidators do
+        %BooleanSchema{} = bs -> validate_boolean_schema(bs, data, sub_vctx, level)
+        _ -> validate(data, subvalidators, sub_vctx)
+      end
+
+    case result do
+      {:ok, data, _} when flag_evaluated? -> {:ok, data, add_evaluated(vctx, key)}
+      {:ok, data, _} -> {:ok, data, vctx}
+      {:error, _} = error -> error
+    end
   end
 
   defp validate_sub_term(data, key, add_eval_path, subvalidators, vctx, boolean_schema_level, flag_evaluated?) do
@@ -383,6 +434,15 @@ defmodule JSV.Validator do
   See `validate_in/5` to validate sub terms of the data.
   """
   @spec validate_as(term, eval_sub_path(), validator(), context) :: result
+  def validate_as(data, _add_eval_path, subvalidators, %ValidationContext{flag: true} = vctx) do
+    sub_vctx = %{vctx | evaluated: push_evaluated(vctx, vctx.evaluated)}
+
+    case validate(data, subvalidators, sub_vctx) do
+      {:ok, data, sub_vctx} -> {:ok, data, merge_tracked(vctx, sub_vctx)}
+      {:error, _} = error -> error
+    end
+  end
+
   def validate_as(data, add_eval_path, subvalidators, vctx) do
     %ValidationContext{evaluated: evaluated, eval_path: eval_path, schema_path: schema_path} = vctx
 
@@ -449,6 +509,19 @@ defmodule JSV.Validator do
 
       {:error, %ValidationContext{errors: [_ | _]} = separate_vctx} ->
         {:error, merge_errors(vctx, separate_vctx)}
+    end
+  end
+
+  defp with_scope(%ValidationContext{flag: true, scope: scopes} = vctx, sub_key, _add_eval_path, fun) do
+    case {Key.namespace_of(sub_key), scopes} do
+      {same, [same | _]} ->
+        fun.(vctx)
+
+      {new_scope, scopes} ->
+        case fun.(%{vctx | scope: [new_scope | scopes]}) do
+          {:ok, data, vctx} -> {:ok, data, %{vctx | scope: scopes}}
+          {:error, _} = error -> error
+        end
     end
   end
 
